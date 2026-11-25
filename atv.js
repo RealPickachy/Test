@@ -1501,14 +1501,19 @@
     function setBodyAttr(name, value) {
       if (!document.body) return;
       value = String(value);
-      if (document.body.getAttribute(name) !== value) document.body.setAttribute(name, value);
+      if (document.body.getAttribute(name) !== value) {
+        document.body.setAttribute(name, value);
+        scheduleCssRegen();
+      }
     }
 
     function syncGlareClass() {
       if (!document.body) return;
       var rich = richEffects();
+      var hadGlare = document.body.classList.contains(GLARE_CLASS);
       if (rich && glareEnabled() && pluginEnabled()) document.body.classList.add(GLARE_CLASS);
       else document.body.classList.remove(GLARE_CLASS);
+      if (hadGlare !== document.body.classList.contains(GLARE_CLASS)) scheduleCssRegen();
       var mode = pluginEnabled() ? getCardAnim() : 'off';
       if (!rich) mode = 'off';
       setBodyAttr(CARD_ANIM_ATTR, mode);
@@ -1545,7 +1550,10 @@
       setBodyAttr(PERF_ATTR, level);
       _imgBlobCacheOn = level === 'high';
       if (level !== 'high') {
-        document.body.classList.remove(GLARE_CLASS);
+        if (document.body.classList.contains(GLARE_CLASS)) {
+          document.body.classList.remove(GLARE_CLASS);
+          scheduleCssRegen();
+        }
         setBodyAttr(CARD_ANIM_ATTR, 'off');
       }
     }
@@ -3547,10 +3555,119 @@
       return names;
     }
 
+    // ── State-specific stylesheet ───────────────────────────────────────────
+    // The browser builds style-invalidation sets from every selector in the sheet,
+    // even from rules whose body-attribute condition can never match. With ~1500
+    // rules that meant each focus move re-checked siblings (.card.focus ~ .card),
+    // whole card subtrees (tilt/glare rules) etc. on every device. So the sheet is
+    // generated for the current settings: rules for other values are left out and
+    // the sheet is regenerated when one of those body attributes changes.
+    var cssSyncing = false;
+    var cssRegenTimer = 0;
+    var CSS_STATE_ATTRS = [CARD_ANIM_ATTR, FONT_SIZE_ATTR, CATEGORY_SIZE_ATTR, CARD_SIZE_ATTR, LOGO_SIZE_ATTR,
+      BACKDROP_ATTR, BADGE_ATTR, RATING_ATTR, RATING_STYLE_ATTR, CARD_IMAGE_MODE_ATTR, PERF_ATTR,
+      FLEX_GAP_ATTR, OVERLAY_ALIGN_ATTR, TOPNAV_SIZE_ATTR];
+
+    function scheduleCssRegen() {
+      if (cssSyncing || cssRegenTimer || !styleSignature) return;
+      cssRegenTimer = setTimeout(function () {
+        cssRegenTimer = 0;
+        if (pluginEnabled() && document.getElementById(STYLE_ID)) injectStyle();
+      }, 0);
+    }
+
+    function readCssState() {
+      var attrs = {};
+      var parts = [];
+      for (var i = 0; i < CSS_STATE_ATTRS.length; i++) {
+        var v = document.body ? document.body.getAttribute(CSS_STATE_ATTRS[i]) : null;
+        attrs[CSS_STATE_ATTRS[i]] = v;
+        parts.push(v);
+      }
+      var glare = !!(document.body && document.body.classList.contains(GLARE_CLASS));
+      var level = attrs[PERF_ATTR] || 'high';
+      parts.push(glare ? 'g' : '-');
+      return { attrs: attrs, glare: glare, level: level, sig: parts.join('|') };
+    }
+
+    function splitSelectorList(prelude) {
+      var out = [];
+      var depth = 0;
+      var start = 0;
+      for (var i = 0; i < prelude.length; i++) {
+        var c = prelude.charAt(i);
+        if (c === '(' || c === '[') depth++;
+        else if (c === ')' || c === ']') depth--;
+        else if (c === ',' && depth === 0) { out.push(prelude.slice(start, i).trim()); start = i + 1; }
+      }
+      out.push(prelude.slice(start).trim());
+      return out;
+    }
+
+    var GLARE_POSITIVE_RE = new RegExp('(^|[^(])\\.' + GLARE_CLASS + '(?![\\w-])');
+
+    function selectorApplies(sel, state) {
+      if (sel.indexOf(':not([data-agnative') === -1) {
+        var re = /\[(data-agnative-[a-z-]+)="([^"]*)"\]/g;
+        var m;
+        while ((m = re.exec(sel))) {
+          if (Object.prototype.hasOwnProperty.call(state.attrs, m[1]) && state.attrs[m[1]] !== m[2]) return false;
+        }
+      }
+      if (!state.glare && GLARE_POSITIVE_RE.test(sel)) return false;
+      if (state.glare && sel.indexOf(':not(.' + GLARE_CLASS + ')') !== -1) return false;
+      // Neighbour slide on focus exists only with full effects.
+      if (state.level !== 'high' && /\.card\.(focus|hover) ~ \.card/.test(sel)) return false;
+      return true;
+    }
+
+    function filterCssRules(text, state) {
+      var out = [];
+      var i = 0;
+      var n = text.length;
+      while (i < n) {
+        var open = text.indexOf('{', i);
+        if (open < 0) break;
+        var depth = 1;
+        var j = open + 1;
+        while (j < n && depth) {
+          var c = text.charAt(j);
+          if (c === '{') depth++;
+          else if (c === '}') depth--;
+          j++;
+        }
+        var prelude = text.slice(i, open).trim();
+        var body = text.slice(open + 1, j - 1);
+        if (prelude.charAt(0) === '@') {
+          if (/^@(media|supports)/.test(prelude)) {
+            var inner = filterCssRules(body, state);
+            if (inner) out.push(prelude + ' {\n' + inner + '\n}');
+          } else {
+            out.push(prelude + ' {' + body + '}');
+          }
+        } else if (prelude) {
+          var sels = splitSelectorList(prelude);
+          var kept = [];
+          for (var k = 0; k < sels.length; k++) if (sels[k] && selectorApplies(sels[k], state)) kept.push(sels[k]);
+          if (kept.length) out.push(kept.join(', ') + ' {' + body + '}');
+        }
+        i = j;
+      }
+      return out.join('\n');
+    }
+
     function injectStyle() {
       if (!document.head && !document.body) return;
+      // Body attributes are the inputs of the rule filter below: bring them up to date first.
+      cssSyncing = true;
+      try {
+        syncGlareClass(); syncFontSize(); syncCardSize(); syncLogoSize(); syncCardFlags();
+        syncPerfMode(); syncFlexGapFlag(); syncOverlayAlign(); syncTopnavSize();
+      } catch (e) { }
+      cssSyncing = false;
+      var cssState = readCssState();
       var existing = document.getElementById(STYLE_ID);
-      if (existing && styleSignature === STYLE_ID) return;
+      if (existing && styleSignature === cssState.sig) return;
 
       var style = existing || document.createElement('style');
       style.id = STYLE_ID;
@@ -4943,7 +5060,6 @@
         'body.' + BODY_CLASS + ' .agnative-hero__overview { font-size:.95em; line-height:1.4; color:rgba(255,255,255,.94); margin:0 0 1.1em; text-shadow:0 1px 8px rgba(0,0,0,.6); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; max-width:100%; font-weight:500; }',
         'body.' + BODY_CLASS + ' .agnative-hero__play.selector { position:absolute; top:0; right:0; bottom:0; left:0; display:block; padding:0; background:transparent !important; border:0 !important; color:transparent !important; font-size:0 !important; cursor:pointer; outline:none; z-index:3; }',
         'body.' + BODY_CLASS + ' .agnative-hero__play.focus, body.' + BODY_CLASS + ' .agnative-hero__play.hover { background:transparent !important; box-shadow:none !important; transform:none !important; color:transparent !important; outline:none !important; }',
-        'body.' + BODY_CLASS + ' .agnative-hero:has(.agnative-hero__play.focus), body.' + BODY_CLASS + ' .agnative-hero:has(.agnative-hero__play.hover) { transform:scale(1.012); box-shadow:0 0 0 1.5px rgba(255,255,255,.9), 0 24px 60px rgba(0,0,0,.5), 0 8px 24px rgba(0,0,0,.3); }',
         'body.' + BODY_CLASS + ' .agnative-hero__indicators { position:absolute; left:50%; right:auto; bottom:1.4em; transform:translateX(-50%); display:inline-flex; gap:.42em; align-items:center; z-index:3; padding:.46em .62em; border-radius:999px; background:rgba(18,18,20,.42); box-shadow:0 2px 12px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(14px) saturate(140%); -webkit-backdrop-filter:blur(14px) saturate(140%); }',
         'body.' + BODY_CLASS + ' .agnative-hero__indicator { display:inline-block; width:.5em; height:.5em; border-radius:999px; background:rgba(255,255,255,.42); border:0; padding:0; cursor:pointer; outline:none; transition:background .25s ease, width .3s cubic-bezier(.22,.61,.36,1), box-shadow .25s ease; }',
         'body.' + BODY_CLASS + ' .agnative-hero__indicator.agnative-hero__indicator--active { background:#fff; width:1.25em; box-shadow:0 1px 4px rgba(0,0,0,.4); }',
@@ -5010,6 +5126,13 @@
         'body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .torrent-item.selector.focus, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .torrent-item.selector.hover, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .torrent-serial.selector.focus, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .torrent-serial.selector.hover, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .online-prestige.selector.focus, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .online-prestige.selector.hover, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .watched-history.selector.focus, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .watched-history.selector.hover { transform:none !important; box-shadow:none !important; background:rgba(255,255,255,.18) !important; border-color:rgba(255,255,255,.28) !important; }',
         'body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .explorer__files .torrent-filter .simple-button.focus, body.' + BODY_CLASS + '[' + PERF_ATTR + '="ultra"] .explorer__files .torrent-filter .simple-button.hover { transform:none !important; box-shadow:none !important; background:rgba(255,255,255,.26) !important; }',
 
+        /* ── Fast navigation: no focus animations while a direction key is held ── */
+        'body.' + BODY_CLASS + '.agnative-fast-nav .card, body.' + BODY_CLASS + '.agnative-fast-nav .card .card__view, body.' + BODY_CLASS + '.agnative-fast-nav .card-episode, body.' + BODY_CLASS + '.agnative-fast-nav .card-episode .full-episode, body.' + BODY_CLASS + '.agnative-fast-nav .card-episode .full-episode__img { transition:none !important; }',
+
+        /* ── Lampa animates .card__view on focus (animation-card-focus); the plugin's !important
+              transform hides it, yet the browser still runs it on the main thread every frame. ── */
+        'body.' + BODY_CLASS + ' .card.focus .card__view, body.' + BODY_CLASS + ' .card.hover .card__view { animation:none !important; }',
+
         /* ── Hero focus ring that does not need :has() (LG/Tizen browsers lack it) ── */
         'body.' + BODY_CLASS + ' .agnative-hero.agnative-hero--focused { transform:scale(1.012); box-shadow:0 0 0 1.5px rgba(255,255,255,.9), 0 24px 60px rgba(0,0,0,.5), 0 8px 24px rgba(0,0,0,.3); }',
 
@@ -5061,12 +5184,13 @@
         weak(['.agnative-hero__indicators']) + ' { backdrop-filter:none !important; -webkit-backdrop-filter:none !important; background:rgba(18,18,20,.72) !important; }',
         weak(['.agnative-hero__title', '.agnative-hero__year', '.agnative-hero__overview']) + ' { text-shadow:0 1px 4px rgba(0,0,0,.8) !important; }'
       ].join('\n');
+      text = filterCssRules(text, cssState);
       if (style.textContent !== text) style.textContent = text;
       if (!style.parentNode) {
         if (document.body) document.body.appendChild(style);
         else document.head.appendChild(style);
       }
-      styleSignature = STYLE_ID;
+      styleSignature = cssState.sig;
     }
 
     function iconSearch() {
@@ -6919,6 +7043,35 @@
       }).observe(document.body, { childList: true, subtree: true });
     }
 
+    // Fast navigation (key held / pressed in quick succession): focus moves every
+    // few dozen ms, and an animated scale on each newly focused card means a new
+    // compositing layer + overlap re-check on every frame. Measured: animated
+    // focus doubled layerization time during fast scrolling. While navigating fast
+    // the card is scaled instantly; single presses keep the smooth animation.
+    var FAST_NAV_CLASS = 'agnative-fast-nav';
+    var fastNavLast = 0;
+    var fastNavTimer = 0;
+
+    function bindFastNavDetector() {
+      if (window.__AGNATIVE_FAST_NAV_BOUND__) return;
+      window.__AGNATIVE_FAST_NAV_BOUND__ = true;
+      window.addEventListener('keydown', function (e) {
+        var k = e.keyCode;
+        if (k < 37 || k > 40) return;
+        var now = Date.now();
+        var body = document.body;
+        if (body && (e.repeat || now - fastNavLast < 260) && !body.classList.contains(FAST_NAV_CLASS)) {
+          body.classList.add(FAST_NAV_CLASS);
+        }
+        fastNavLast = now;
+        if (fastNavTimer) clearTimeout(fastNavTimer);
+        fastNavTimer = setTimeout(function () {
+          fastNavTimer = 0;
+          if (document.body) document.body.classList.remove(FAST_NAV_CLASS);
+        }, 320);
+      }, true);
+    }
+
     function bindInputModeDetector() {
       if (window.__AGNATIVE_INPUT_MODE_BOUND__) return;
       window.__AGNATIVE_INPUT_MODE_BOUND__ = true;
@@ -7093,6 +7246,7 @@
       applyHiddenSettingsSectionsCSS();
       observeCards();
       bindInputModeDetector();
+      bindFastNavDetector();
       initGlareRuntime();
       neutralizeMenuController();
       patchActivityPushForMenu();
